@@ -186,11 +186,24 @@
               rm -f /persist/home-dev/.ssh/authorized_keys
 
               if [ -f "$ENV_FILE" ]; then
+                # 1. SSH-Key setzen
                 PUBKEY=$(grep -E "^[[:space:]]*DEV_SSH_PUBKEY=" "$ENV_FILE" | tail -n 1 | cut -d= -f2- | tr -d "\r\"'")
                 if [ -n "$PUBKEY" ]; then
                   echo "$PUBKEY" > /persist/home-dev/.ssh/authorized_keys
                   chmod 600 /persist/home-dev/.ssh/authorized_keys
                 fi
+
+                # 2. Git Identität setzen
+                GIT_NAME=$(grep -E "^[[:space:]]*GIT_USER_NAME=" "$ENV_FILE" | tail -n 1 | cut -d= -f2- | tr -d "\r\"'")
+                GIT_MAIL=$(grep -E "^[[:space:]]*GIT_USER_EMAIL=" "$ENV_FILE" | tail -n 1 | cut -d= -f2- | tr -d "\r\"'")
+
+                if [ -n "$GIT_NAME" ]; then
+                  ${pkgs.git}/bin/git config --file /persist/home-dev/.gitconfig user.name "$GIT_NAME"
+                fi
+                if [ -n "$GIT_MAIL" ]; then
+                  ${pkgs.git}/bin/git config --file /persist/home-dev/.gitconfig user.email "$GIT_MAIL"
+                fi
+                chown 1000:1000 /persist/home-dev/.gitconfig 2>/dev/null || true
               fi
 
               chmod 700 /persist/home-dev/.ssh
