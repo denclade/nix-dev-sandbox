@@ -1,0 +1,225 @@
+# ~/code/nix-dev-sandbox/flake.nix
+{
+  description = "Zentrale MicroVM Sandbox für SolidJS, Rust/Tauri & SailfishOS";
+
+  inputs = {
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    microvm = {
+      url = "github:microvm-nix/microvm.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs = { self, nixpkgs, microvm }: {
+    lib.mkDevSandbox = {
+      name,
+      hostname ? "dev-vm",
+      sshPort ? 2222,
+      ports ? [],
+      vcpu ? 4,
+      mem ? 4096,
+      diskSize ? 16384,
+      # Mögliche Profile: "solid", "tauri", "sailfish", "playwright", "pocketbase"
+      profiles ? [ "solid" ],
+      extraPackages ? (pkgs: []),
+      extraEnv ? {}
+    }:
+    let
+      system = "x86_64-linux";
+      workspacePath = "/workspaces/${name}";
+      hasProfile = p: builtins.elem p profiles;
+      needsNode = (hasProfile "solid") || (hasProfile "tauri");
+    in (nixpkgs.lib.nixosSystem {
+      inherit system;
+      modules = [
+        microvm.nixosModules.microvm
+        ({ config, lib, pkgs, ... }: {
+          networking.hostName = hostname;
+          system.stateVersion = "24.11";
+
+          microvm = {
+            hypervisor = "qemu";
+            inherit vcpu mem;
+
+            shares = [
+              {
+                proto = "9p";
+                tag = "workspace";
+                source = "./.";
+                mountPoint = workspacePath;
+                securityModel = "none";
+              }
+              {
+                proto = "9p";
+                tag = "ro-store";
+                source = "/nix/store";
+                mountPoint = "/nix/.ro-store";
+                securityModel = "none";
+              }
+            ];
+
+            volumes = [{
+              image = ".microvm-state/persistent.img";
+              mountPoint = "/persist";
+              size = diskSize;
+            }];
+
+            interfaces = [{
+              type = "user";
+              id = "usernet";
+              mac = "02:00:00:00:00:01";
+            }];
+
+            forwardPorts = [
+              { from = "host"; host.port = sshPort; guest.port = 22; }
+            ] ++ (map (p: { from = "host"; host.port = p; guest.port = p; }) ports);
+          };
+
+          fileSystems."/home/dev" = {
+            device = "/persist/home-dev";
+            fsType = "none";
+            options = [ "bind" "X-mount.mkdir" ];
+          };
+
+          users.groups.dev.gid = 1000;
+          users.users.dev = {
+            isNormalUser = true;
+            uid = 1000;
+            group = "dev";
+            extraGroups = [ "wheel" ];
+            shell = pkgs.bashInteractive;
+          };
+          security.sudo.wheelNeedsPassword = false;
+
+          services.openssh = {
+            enable = true;
+            settings.PasswordAuthentication = false;
+            authorizedKeysFiles = lib.mkForce [ ".ssh/authorized_keys" ];
+          };
+
+          # nix-ld nur noch für den VS Code Remote Server nötig!
+          programs.nix-ld = {
+            enable = true;
+            libraries = with pkgs; [ stdenv.cc.cc zlib openssl icu libatomic_ops ];
+          };
+
+          # --- Modulare Pakete je nach gewähltem Profil ---
+          environment.systemPackages = with pkgs; [
+            # Basis (in jedem Projekt)
+            git git-lfs curl gnupg less procps unzip xz bash-completion
+            just # Unser Command-Runner (ersetzt mise tasks)
+          ]
+          # 1. Profil: SolidJS / Web
+          ++ lib.optionals needsNode [
+            nodejs_22 # oder pkgs.nodejs (aktuellste Version in nixpkgs)
+            pnpm
+          ]
+          # 2. Profil: PocketBase (direkt aus Nix statt per Bash-Download!)
+          ++ lib.optionals (hasProfile "pocketbase") [
+            pocketbase
+          ]
+          # 3. Profil: Playwright (Browser direkt aus dem Nix-Store!)
+          ++ lib.optionals (hasProfile "playwright") [
+            playwright-driver.browsers
+          ]
+          # 4. Profil: Rust + Tauri
+          ++ lib.optionals (hasProfile "tauri") [
+            rustc cargo rustfmt clippy rust-analyzer
+            pkg-config cargo-tauri
+            glib gtk3 webkitgtk_4_1 libsoup_3 cairo pango gdk-pixbuf atk
+            libappindicator librsvg openssl
+          ]
+          # 5. Profil: SailfishOS (Qt/C++/RPM/QML Tooling)
+          ++ lib.optionals (hasProfile "sailfish") [
+            cmake ninja gcc gdb pkg-config rpm
+            qt5.qtbase qt5.qtdeclarative qt5.qtquickcontrols2 qt5.qttools
+          ]
+          ++ (extraPackages pkgs);
+
+          # --- Modulare Umgebungsvariablen ---
+          environment.sessionVariables = {
+            DEVCONTAINER = "true";
+            HISTFILE = "/home/dev/.bash_history";
+          }
+          // lib.optionalAttrs needsNode {
+            VITE_HOST = "0.0.0.0";
+            PNPM_HOME = "/home/dev/.local/share/pnpm";
+            PNPM_CONFIG_STORE_DIR = "${workspacePath}/node_modules/.pnpm-store";
+          }
+          // lib.optionalAttrs (hasProfile "playwright") {
+            # Weist Playwright an, den NixOS-eigenen Browser zu nutzen (kein Download nötig!)
+            PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
+            PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";
+          }
+          // lib.optionalAttrs (hasProfile "tauri") {
+            PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.webkitgtk_4_1.dev}/lib/pkgconfig:${pkgs.gtk3.dev}/lib/pkgconfig:${pkgs.libsoup_3.dev}/lib/pkgconfig";
+          }
+          // extraEnv;
+
+          # Shell-Init: node_modules/.bin im PATH & "jump" als Alias für "just"
+          environment.interactiveShellInit = ''
+            export PATH="${workspacePath}/node_modules/.bin:/home/dev/.local/bin:$PATH"
+            alias jump="just"
+            alias j="just"
+            shopt -s histappend
+            export PROMPT_COMMAND="history -a; ''${PROMPT_COMMAND:-}"
+            cd ${workspacePath} 2>/dev/null || true
+          '';
+
+          # Setup-Service (SSH-Key aus .env & optional isoliertes node_modules/target)
+          systemd.services.sandbox-setup = {
+            description = "Prepare Persistent Home, SSH Key and Isolated Build Dirs";
+            wantedBy = [ "multi-user.target" ];
+            before = [ "sshd.service" ];
+            after = [ "local-fs.target" ];
+            unitConfig = {
+              RequiresMountsFor = [ "/persist" workspacePath "/home/dev" ];
+            };
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = true;
+            };
+            path = [ pkgs.gnugrep pkgs.coreutils pkgs.util-linux ];
+            script = ''
+              mkdir -p /persist/home-dev/.ssh
+              ENV_FILE="${workspacePath}/.env"
+              rm -f /persist/home-dev/.ssh/authorized_keys
+
+              if [ -f "$ENV_FILE" ]; then
+                PUBKEY=$(grep -E "^[[:space:]]*DEV_SSH_PUBKEY=" "$ENV_FILE" | tail -n 1 | cut -d= -f2- | tr -d "\r\"'")
+                if [ -n "$PUBKEY" ]; then
+                  echo "$PUBKEY" > /persist/home-dev/.ssh/authorized_keys
+                  chmod 600 /persist/home-dev/.ssh/authorized_keys
+                fi
+              fi
+
+              chmod 700 /persist/home-dev/.ssh
+              chmod 755 /persist/home-dev
+              chown -R 1000:1000 /persist/home-dev
+
+              # Nur für Node/Solid-Projekte: isoliertes node_modules mounten
+              ${lib.optionalString needsNode ''
+                mkdir -p /persist/node_modules ${workspacePath}/node_modules
+                chown 1000:1000 /persist/node_modules
+                if ! mountpoint -q ${workspacePath}/node_modules; then
+                  mount --bind /persist/node_modules ${workspacePath}/node_modules
+                fi
+                chown 1000:1000 ${workspacePath}/node_modules
+              ''}
+
+              # Nur für Rust/Tauri-Projekte: isoliertes target/ Verzeichnis auf schnellem VM-Volume
+              ${lib.optionalString (hasProfile "tauri") ''
+                mkdir -p /persist/cargo-target ${workspacePath}/target
+                chown 1000:1000 /persist/cargo-target
+                if ! mountpoint -q ${workspacePath}/target; then
+                  mount --bind /persist/cargo-target ${workspacePath}/target
+                fi
+                chown 1000:1000 ${workspacePath}/target
+              ''}
+            '';
+          };
+        })
+      ];
+    }).config.microvm.declaredRunner;
+  };
+}
