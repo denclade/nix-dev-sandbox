@@ -105,6 +105,8 @@
                 nss nspr cairo pango atk at-spi2-atk cups dbus libdrm mesa
                 libxkbcommon alsa-lib glib expat libx11 libxcomposite libxdamage
                 libxext libxfixes libxrandr libxcb libxshmfence
+                gtk3 gdk-pixbuf libxt libxcursor libxi libxrender
+                freetype fontconfig pciutils ffmpeg
               ];
             };
 
@@ -120,7 +122,7 @@
             ]
             ++ lib.optionals needsNode [ nodejs pnpm ]
             ++ lib.optionals (hasProfile "pocketbase") [ pocketbase ]
-            ++ lib.optionals (hasProfile "playwright") [ playwright-driver.browsers ]
+            ++ lib.optionals (hasProfile "playwright") [ playwright-driver.browsers firefox ]
             ++ lib.optionals (hasProfile "tauri") [
               rustc cargo rustfmt clippy rust-analyzer pkg-config cargo-tauri
               glib gtk3 webkitgtk_4_1 libsoup_3 cairo pango gdk-pixbuf atk
