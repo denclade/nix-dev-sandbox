@@ -159,7 +159,10 @@
 
             services.openssh = {
               enable = true;
-              settings.PasswordAuthentication = false;
+              settings = {
+                PasswordAuthentication = false;
+                X11Forwarding = true;
+              };
               authorizedKeysFiles = lib.mkForce [ ".ssh/authorized_keys" ];
             };
 
@@ -195,7 +198,7 @@
               libappindicator librsvg openssl dbus zlib harfbuzz
             ] ++ (if hasProfile "rustup" then [ rustup ] else [ rustc cargo rustfmt clippy rust-analyzer ]))
             ++ lib.optionals (hasProfile "desktop") [
-              xvfb dbus gnome-keyring libsecret desktop-file-utils xdg-utils
+              xvfb dbus gnome-keyring libsecret desktop-file-utils xdg-utils xorg.xauth
             ]
             ++ lib.optionals (hasProfile "android") [ androidSdk jdk21 ]
             ++ lib.optionals (hasProfile "flatpak") [ flatpak-builder ]
@@ -240,7 +243,6 @@
               GIO_EXTRA_MODULES = "${pkgs.glib-networking}/lib/gio/modules";
             }
             // lib.optionalAttrs (hasProfile "desktop") {
-              DISPLAY = ":99";
               # Kein Accessibility-Bus in der VM: sagen statt GTK in den Timeout laufen lassen.
               NO_AT_BRIDGE = "1";
             }
@@ -259,6 +261,10 @@
 
             environment.interactiveShellInit = ''
               export PATH="${workspacePath}/node_modules/.bin:/home/dev/.local/bin:${lib.optionalString (hasProfile "rustup") "/home/dev/.cargo/bin:"}$PATH"
+              ${lib.optionalString (hasProfile "desktop") ''
+                # SSH X11-Forwarding erhält Vorrang vor dem internen Xvfb :99
+                export DISPLAY="''${DISPLAY:-:99}"
+              ''}
               alias jump="just"
               alias j="just"
               shopt -s histappend
