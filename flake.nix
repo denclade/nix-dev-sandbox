@@ -191,8 +191,8 @@
             ++ lib.optionals (hasProfile "playwright") [ playwright-driver.browsers firefox ]
             ++ lib.optionals (hasProfile "tauri") ([
               gcc pkg-config cargo-tauri
-              glib glib-networking gtk3 webkitgtk_4_1 libsoup_3 cairo pango gdk-pixbuf atk
-              libappindicator librsvg openssl
+              glib glib-networking gtk3 webkitgtk_4_1 libsoup_3 cairo pango gdk-pixbuf atk at-spi2-core
+              libappindicator librsvg openssl dbus zlib harfbuzz
             ] ++ (if hasProfile "rustup" then [ rustup ] else [ rustc cargo rustfmt clippy rust-analyzer ]))
             ++ lib.optionals (hasProfile "desktop") [
               xvfb dbus gnome-keyring libsecret desktop-file-utils xdg-utils
@@ -221,7 +221,21 @@
               PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
             }
             // lib.optionalAttrs (hasProfile "tauri") {
-              PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.webkitgtk_4_1.dev}/lib/pkgconfig:${pkgs.gtk3.dev}/lib/pkgconfig:${pkgs.libsoup_3.dev}/lib/pkgconfig";
+              PKG_CONFIG_PATH = (lib.makeSearchPathOutput "dev" "lib/pkgconfig" ([
+                pkgs.openssl
+                pkgs.webkitgtk_4_1
+                pkgs.gtk3
+                pkgs.libsoup_3
+                pkgs.glib
+                pkgs.pango
+                pkgs.cairo
+                pkgs.gdk-pixbuf
+                pkgs.at-spi2-core
+                pkgs.harfbuzz
+                pkgs.librsvg
+                pkgs.dbus
+                pkgs.zlib
+              ] ++ (extraPackages pkgs))) + ":${pkgs.zlib.dev}/share/pkgconfig";
               # Ohne glib-networking kann WebKitGTK kein TLS.
               GIO_EXTRA_MODULES = "${pkgs.glib-networking}/lib/gio/modules";
             }
