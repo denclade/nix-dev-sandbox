@@ -1,5 +1,5 @@
 {
-  description = "Zentrale MicroVM Sandbox für SolidJS, Rust/Tauri & SailfishOS";
+  description = "Zentrale MicroVM Sandbox für SolidJS, Rust/Tauri, Android & SailfishOS";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -20,7 +20,9 @@
       diskSize ? 16384,
       profiles ? [ "solid" ],
       extraPackages ? (pkgs: []),
-      extraEnv ? {}
+      extraEnv ? {},
+      # Nur für das Profil "android": überschreibt einzelne Felder von androidDefaults.
+      android ? {}
     }:
     let
       system = "x86_64-linux";
@@ -29,13 +31,57 @@
       hasProfile = p: builtins.elem p profiles;
       needsNode = (hasProfile "solid") || (hasProfile "tauri");
 
+      # Profile:
+      #   solid       Node, pnpm
+      #   playwright  Chromium/Firefox aus Nix plus ihre Bibliotheken
+      #   pocketbase  PocketBase, backend/pb_data auf /persist
+      #   tauri       Rust-Toolchain, WebKitGTK & Co., Tauri-CLI
+      #   rustup      mit tauri: rustup statt der Rust-Toolchain aus Nix (für Cross-Targets wie Android)
+      #   desktop     virtueller Bildschirm :99, D-Bus-Session-Werkzeuge, gnome-keyring/libsecret
+      #   android     Android-SDK/NDK/Emulator aus Nix, JDK 21, KVM für den Emulator
+      #   flatpak     flatpak + flatpak-builder (Flatpak-Dienst und Portal im Gast)
+      #   sailfish    Qt5, CMake, RPM
+      androidDefaults = {
+        platformVersions = [ "35" "36" ];
+        buildToolsVersion = "36.0.0";
+        ndkVersion = "27.2.12479018";
+        # Das Emulator-Image; seine Plattform muss in platformVersions stehen.
+        systemImagePlatform = "35";
+        systemImageType = "google_apis";
+        abi = "x86_64";
+      };
+      androidConfig = androidDefaults // android;
+
       vmSystem = nixpkgs.lib.nixosSystem {
         inherit system;
         modules = [
           microvm.nixosModules.microvm
-          ({ config, lib, pkgs, ... }: {
+          ({ config, lib, pkgs, ... }:
+          let
+            androidSdk = (pkgs.androidenv.composeAndroidPackages {
+              inherit (androidConfig) platformVersions;
+              buildToolsVersions = [ androidConfig.buildToolsVersion ];
+              includeNDK = true;
+              ndkVersions = [ androidConfig.ndkVersion ];
+              includeEmulator = true;
+              includeSystemImages = true;
+              systemImageTypes = [ androidConfig.systemImageType ];
+              abiVersions = [ androidConfig.abi ];
+            }).androidsdk;
+            androidHome = "${androidSdk}/libexec/android-sdk";
+          in {
             networking.hostName = hostname;
             system.stateVersion = "24.11";
+
+            # Das Android-SDK steht unter Googles Lizenz und ist unfrei.
+            nixpkgs.config = lib.mkIf (hasProfile "android") {
+              allowUnfree = true;
+              android_sdk.accept_license = true;
+            };
+
+            # Der Emulator braucht /dev/kvm im Gast: verschachtelte Virtualisierung,
+            # auf dem Host einmal `kvm_intel nested=1` bzw. `kvm_amd nested=1`.
+            boot.kernelModules = lib.optionals (hasProfile "android") [ "kvm-intel" "kvm-amd" ];
 
             microvm = {
               hypervisor = "qemu";
@@ -86,10 +132,30 @@
               isNormalUser = true;
               uid = 1000;
               group = "dev";
-              extraGroups = [ "wheel" ];
+              extraGroups = [ "wheel" ] ++ lib.optional (hasProfile "android") "kvm";
               shell = pkgs.bashInteractive;
             };
             security.sudo.wheelNeedsPassword = false;
+
+            # GUI-Programme ohne Bildschirm: ein virtueller auf :99 (DISPLAY steht unten).
+            systemd.tmpfiles.rules = lib.optionals (hasProfile "desktop") [ "d /tmp/.X11-unix 1777 root root -" ];
+            systemd.services.xvfb = lib.mkIf (hasProfile "desktop") {
+              description = "Virtual X display :99";
+              wantedBy = [ "multi-user.target" ];
+              after = [ "systemd-tmpfiles-setup.service" ];
+              serviceConfig = {
+                User = "dev";
+                ExecStart = "${pkgs.xvfb}/bin/Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp";
+                Restart = "on-failure";
+              };
+            };
+
+            services.flatpak.enable = hasProfile "flatpak";
+            xdg.portal = lib.mkIf (hasProfile "flatpak") {
+              enable = true;
+              extraPortals = [ pkgs.xdg-desktop-portal-gtk ];
+              config.common.default = "*";
+            };
 
             services.openssh = {
               enable = true;
@@ -123,11 +189,16 @@
             ++ lib.optionals needsNode [ nodejs pnpm ]
             ++ lib.optionals (hasProfile "pocketbase") [ pocketbase ]
             ++ lib.optionals (hasProfile "playwright") [ playwright-driver.browsers firefox ]
-            ++ lib.optionals (hasProfile "tauri") [
-              rustc cargo rustfmt clippy rust-analyzer pkg-config cargo-tauri
-              glib gtk3 webkitgtk_4_1 libsoup_3 cairo pango gdk-pixbuf atk
+            ++ lib.optionals (hasProfile "tauri") ([
+              gcc pkg-config cargo-tauri
+              glib glib-networking gtk3 webkitgtk_4_1 libsoup_3 cairo pango gdk-pixbuf atk
               libappindicator librsvg openssl
+            ] ++ (if hasProfile "rustup" then [ rustup ] else [ rustc cargo rustfmt clippy rust-analyzer ]))
+            ++ lib.optionals (hasProfile "desktop") [
+              xvfb dbus gnome-keyring libsecret desktop-file-utils xdg-utils
             ]
+            ++ lib.optionals (hasProfile "android") [ androidSdk jdk21 ]
+            ++ lib.optionals (hasProfile "flatpak") [ flatpak-builder ]
             ++ lib.optionals (hasProfile "sailfish") [
               cmake ninja gcc gdb pkg-config rpm
               qt5.qtbase qt5.qtdeclarative qt5.qtquickcontrols2 qt5.qttools
@@ -151,11 +222,29 @@
             }
             // lib.optionalAttrs (hasProfile "tauri") {
               PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.webkitgtk_4_1.dev}/lib/pkgconfig:${pkgs.gtk3.dev}/lib/pkgconfig:${pkgs.libsoup_3.dev}/lib/pkgconfig";
+              # Ohne glib-networking kann WebKitGTK kein TLS.
+              GIO_EXTRA_MODULES = "${pkgs.glib-networking}/lib/gio/modules";
+            }
+            // lib.optionalAttrs (hasProfile "desktop") {
+              DISPLAY = ":99";
+              # Kein Accessibility-Bus in der VM: sagen statt GTK in den Timeout laufen lassen.
+              NO_AT_BRIDGE = "1";
+            }
+            // lib.optionalAttrs (hasProfile "android") {
+              ANDROID_HOME = androidHome;
+              ANDROID_SDK_ROOT = androidHome;
+              NDK_HOME = "${androidHome}/ndk/${androidConfig.ndkVersion}";
+              ANDROID_NDK_ROOT = "${androidHome}/ndk/${androidConfig.ndkVersion}";
+              JAVA_HOME = "${pkgs.jdk21.home}";
+              # aapt2 aus Maven ist ein fremdes Binary; das aus dem SDK läuft hier.
+              GRADLE_OPTS = "-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidHome}/build-tools/${androidConfig.buildToolsVersion}/aapt2";
+              # Welches Image ein AVD braucht, für `avdmanager create avd -k "$ANDROID_SYSTEM_IMAGE"`.
+              ANDROID_SYSTEM_IMAGE = "system-images;android-${androidConfig.systemImagePlatform};${androidConfig.systemImageType};${androidConfig.abi}";
             }
             // extraEnv;
 
             environment.interactiveShellInit = ''
-              export PATH="${workspacePath}/node_modules/.bin:/home/dev/.local/bin:$PATH"
+              export PATH="${workspacePath}/node_modules/.bin:/home/dev/.local/bin:${lib.optionalString (hasProfile "rustup") "/home/dev/.cargo/bin:"}$PATH"
               alias jump="just"
               alias j="just"
               shopt -s histappend
