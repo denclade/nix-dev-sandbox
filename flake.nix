@@ -13,6 +13,11 @@
     lib.mkDevSandbox = {
       name,
       hostname ? "dev-vm",
+      # Adresse, an die alle weitergeleiteten Ports auf dem Host gebunden werden.
+      # Jede VM bekommt ihre eigene aus 127.0.0.0/8 (z.B. 127.0.10.1, 127.0.10.2, …):
+      # dann kollidieren weder SSH noch App-Ports zwischen parallel laufenden VMs,
+      # und nichts davon ist im LAN erreichbar. Leer ("") bindet an alle Interfaces.
+      hostAddress ? "127.0.0.1",
       sshPort ? 2222,
       ports ? [],
       vcpu ? 4,
@@ -22,7 +27,9 @@
       extraPackages ? (pkgs: []),
       extraEnv ? {},
       # Nur für das Profil "android": überschreibt einzelne Felder von androidDefaults.
-      android ? {}
+      android ? {},
+      # Nur für das Profil "sailfish": überschreibt einzelne Felder von sailfishDefaults.
+      sailfish ? {}
     }:
     let
       system = "x86_64-linux";
@@ -40,7 +47,9 @@
       #   desktop     virtueller Bildschirm :99, D-Bus-Session-Werkzeuge, gnome-keyring/libsecret
       #   android     Android-SDK/NDK/Emulator aus Nix, JDK 21, KVM für den Emulator
       #   flatpak     flatpak + flatpak-builder (Flatpak-Dienst und Portal im Gast)
-      #   sailfish    Qt5, CMake, RPM
+      #   sailfish    Anbindung an das Sailfish SDK auf dem Host: Build-Engine und Emulator
+      #               per SSH über 10.0.2.2, das SDK-Verzeichnis read-only unter
+      #               /opt/sailfish-sdk; dazu qmllint, Python, RPM-Werkzeuge
       androidDefaults = {
         platformVersions = [ "35" "36" ];
         buildToolsVersion = "36.0.0";
@@ -51,6 +60,15 @@
         abi = "x86_64";
       };
       androidConfig = androidDefaults // android;
+
+      # Das SDK selbst (Docker-Build-Engine, VirtualBox-Emulator) bleibt auf dem Host;
+      # der Gast erreicht dessen 127.0.0.1 über SLiRP als 10.0.2.2.
+      sailfishDefaults = {
+        engineSshPort = 2222;
+        emulatorSshPort = 2223;
+      };
+      sailfishConfig = sailfishDefaults // sailfish;
+      sailfishSdkMount = "/opt/sailfish-sdk";
 
       vmSystem = nixpkgs.lib.nixosSystem {
         inherit system;
@@ -72,6 +90,12 @@
           in {
             networking.hostName = hostname;
             system.stateVersion = "24.11";
+
+            assertions = [{
+              assertion = !(hasProfile "sailfish")
+                || !(builtins.elem sshPort [ sailfishConfig.engineSshPort sailfishConfig.emulatorSshPort ]);
+              message = "sshPort ${toString sshPort} gehört auf dem Host schon der Sailfish-Build-Engine bzw. dem Emulator; einen anderen wählen.";
+            }];
 
             # Das Android-SDK steht unter Googles Lizenz und ist unfrei.
             nixpkgs.config = lib.mkIf (hasProfile "android") {
@@ -102,7 +126,16 @@
                   mountPoint = "/nix/.ro-store";
                   securityModel = "none";
                 }
-              ];
+              ] ++ lib.optional (hasProfile "sailfish") {
+                # Ein Symlink, den run-microvm auf das SDK des Hosts setzt: dessen Pfad
+                # steht erst zur Laufzeit fest ($SAILFISH_SDK_PATH bzw. .env).
+                proto = "9p";
+                tag = "sailfish-sdk";
+                source = ".microvm-state/sailfish-sdk";
+                mountPoint = sailfishSdkMount;
+                securityModel = "none";
+                readOnly = true;
+              };
 
               volumes = [{
                 image = ".microvm-state/persistent.img";
@@ -116,9 +149,8 @@
                 mac = "02:00:00:00:00:01";
               }];
 
-              forwardPorts = [
-                { from = "host"; host.port = sshPort; guest.port = 22; }
-              ] ++ (map (p: { from = "host"; host.port = p; guest.port = p; }) ports);
+              forwardPorts = map (p: { from = "host"; host.address = hostAddress; host.port = p.host; guest.port = p.guest; })
+                ([ { host = sshPort; guest = 22; } ] ++ (map (p: { host = p; guest = p; }) ports));
             };
 
             fileSystems."/home/dev" = {
@@ -202,9 +234,12 @@
             ]
             ++ lib.optionals (hasProfile "android") [ androidSdk jdk21 ]
             ++ lib.optionals (hasProfile "flatpak") [ flatpak-builder ]
+            # Gebaut wird in der Build-Engine (sb2, mb2); hier nur, was der Editor und die
+            # Skripte drumherum brauchen. Kein Qt aus Nix zum Bauen: das wäre 5.15, das
+            # Target hat 5.6 -- IntelliSense nimmt die Header aus dem SDK-Sysroot.
             ++ lib.optionals (hasProfile "sailfish") [
-              cmake ninja gcc gdb pkg-config rpm
-              qt5.qtbase qt5.qtdeclarative qt5.qtquickcontrols2 qt5.qttools
+              openssh rsync python3 gcc gdb rpm file
+              qt5.qtdeclarative  # qmllint
             ]
             ++ (extraPackages pkgs);
 
@@ -257,6 +292,16 @@
               # Welches Image ein AVD braucht, für `avdmanager create avd -k "$ANDROID_SYSTEM_IMAGE"`.
               ANDROID_SYSTEM_IMAGE = "system-images;android-${androidConfig.systemImagePlatform};${androidConfig.systemImageType};${androidConfig.abi}";
             }
+            // lib.optionalAttrs (hasProfile "sailfish") {
+              IN_SAILFISH_SANDBOX = "true";
+              SAILFISH_SDK_PATH = sailfishSdkMount;
+              # Kopie des SDK-Schlüssels mit Rechten, die ssh akzeptiert (sandbox-setup).
+              SAILFISH_SDK_SSH_KEY = "/home/dev/.ssh/sailfish-sdk";
+              SAILFISH_ENGINE_HOST = "10.0.2.2";
+              SAILFISH_ENGINE_PORT = toString sailfishConfig.engineSshPort;
+              SAILFISH_EMULATOR_HOST = "10.0.2.2";
+              SAILFISH_EMULATOR_PORT = toString sailfishConfig.emulatorSshPort;
+            }
             // extraEnv;
 
             environment.interactiveShellInit = ''
@@ -278,7 +323,8 @@
               before = [ "sshd.service" ];
               after = [ "local-fs.target" ];
               unitConfig = {
-                RequiresMountsFor = [ "/persist" workspacePath "/home/dev" ];
+                RequiresMountsFor = [ "/persist" workspacePath "/home/dev" ]
+                  ++ lib.optional (hasProfile "sailfish") sailfishSdkMount;
               };
               serviceConfig = {
                 Type = "oneshot";
@@ -342,6 +388,13 @@
                   fi
                   chown 1000:1000 ${workspacePath}/target
                 ''}
+
+                ${lib.optionalString (hasProfile "sailfish") ''
+                  # Über 9p behält der Schlüssel Eigentümer und Rechte des Hosts.
+                  install -m 600 -o 1000 -g 1000 ${sailfishSdkMount}/vmshare/ssh/private_keys/sdk \
+                    /persist/home-dev/.ssh/sailfish-sdk \
+                    || echo "sandbox-setup: kein SDK-Schlüssel unter ${sailfishSdkMount}/vmshare/ssh/private_keys" >&2
+                ''}
               '';
             };
           })
@@ -351,7 +404,23 @@
     in
       pkgs.writeShellScriptBin "run-microvm" ''
         mkdir -p .microvm-state
+        # Wo das Projekt auf dem Host liegt; der Gast sieht es nur unter ${workspacePath}.
+        pwd -P > .microvm-state/host-workspace
+        ${nixpkgs.lib.optionalString (hasProfile "sailfish") ''
+          sdk="''${SAILFISH_SDK_PATH:-}"
+          if [ -z "$sdk" ] && [ -f .env ]; then
+            sdk=$(grep -E "^[[:space:]]*SAILFISH_SDK_PATH=" .env | tail -n 1 | cut -d= -f2- | tr -d "\r\"'")
+          fi
+          sdk="''${sdk:-$HOME/SailfishOS}"
+          sdk="''${sdk//\$HOME/$HOME}"
+          if [ ! -d "$sdk/vmshare" ]; then
+            echo "run-microvm: kein Sailfish SDK unter $sdk -- SAILFISH_SDK_PATH setzen" >&2
+            exit 1
+          fi
+          ln -sfn "$(realpath "$sdk")" .microvm-state/sailfish-sdk
+        ''}
         exec ${runner}/bin/microvm-run "$@"
       '';
   };
 }
+
