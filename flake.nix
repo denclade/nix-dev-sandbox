@@ -1,5 +1,5 @@
 {
-  description = "Zentrale MicroVM Sandbox für SolidJS, Rust/Tauri, Android & SailfishOS";
+  description = "Zentrale MicroVM Sandbox für SolidJS, Rust/Tauri, Android, SailfishOS & Godot";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -29,7 +29,9 @@
       # Nur für das Profil "android": überschreibt einzelne Felder von androidDefaults.
       android ? {},
       # Nur für das Profil "sailfish": überschreibt einzelne Felder von sailfishDefaults.
-      sailfish ? {}
+      sailfish ? {},
+      # Nur für das Profil "godot": überschreibt einzelne Felder von godotDefaults.
+      godot ? {}
     }:
     let
       system = "x86_64-linux";
@@ -50,6 +52,10 @@
       #   sailfish    Anbindung an das Sailfish SDK auf dem Host: Build-Engine und Emulator
       #               per SSH über 10.0.2.2, das SDK-Verzeichnis read-only unter
       #               /opt/sailfish-sdk; dazu qmllint, Python, RPM-Werkzeuge
+      #   godot       das offizielle Godot-Binary in genau der Version aus godotDefaults
+      #               (als `godot`, über nix-ld), Mesa in Software (llvmpipe/lavapipe),
+      #               dieselben Bibliotheken für exportierte Builds; .godot/ auf /persist.
+      #               Für ein Fenster zusammen mit "desktop" (Xvfb :99 bzw. ssh -X)
       androidDefaults = {
         platformVersions = [ "35" "36" ];
         buildToolsVersion = "36.0.0";
@@ -70,6 +76,15 @@
       sailfishConfig = sailfishDefaults // sailfish;
       sailfishSdkMount = "/opt/sailfish-sdk";
 
+      # Das offizielle Release statt Godot aus nixpkgs: Projekte legen sich in
+      # project.godot auf eine Version fest, und die Export-Templates von GitHub
+      # müssen exakt dazu passen. Neue Version: version und hash zusammen ändern.
+      godotDefaults = {
+        version = "4.7.2";
+        hash = "sha256-yt0yBOcoo10/E623/Q15AmNrefa5XEDCZetztsNTKeQ=";
+      };
+      godotConfig = godotDefaults // godot;
+
       vmSystem = nixpkgs.lib.nixosSystem {
         inherit system;
         modules = [
@@ -87,6 +102,19 @@
               abiVersions = [ androidConfig.abi ];
             }).androidsdk;
             androidHome = "${androidSdk}/libexec/android-sdk";
+
+            # Godot linkt nur gegen die libc und lädt X11, Wayland, GL, Vulkan und
+            # Audio per dlopen; die Bibliotheken dafür kommen über nix-ld (unten).
+            godotBin = pkgs.runCommand "godot-${godotConfig.version}" {
+              nativeBuildInputs = [ pkgs.unzip ];
+              src = pkgs.fetchurl {
+                url = "https://github.com/godotengine/godot/releases/download/${godotConfig.version}-stable/Godot_v${godotConfig.version}-stable_linux.x86_64.zip";
+                inherit (godotConfig) hash;
+              };
+            } ''
+              unzip -q "$src"
+              install -Dm755 Godot_v${godotConfig.version}-stable_linux.x86_64 $out/bin/godot
+            '';
           in {
             networking.hostName = hostname;
             system.stateVersion = "24.11";
@@ -106,6 +134,10 @@
             # Der Emulator braucht /dev/kvm im Gast: verschachtelte Virtualisierung,
             # auf dem Host einmal `kvm_intel nested=1` bzw. `kvm_amd nested=1`.
             boot.kernelModules = lib.optionals (hasProfile "android") [ "kvm-intel" "kvm-amd" ];
+
+            # Keine GPU in der VM: Mesa rendert in Software, GL über llvmpipe,
+            # Vulkan über lavapipe -- beides unter /run/opengl-driver.
+            hardware.graphics.enable = hasProfile "godot";
 
             microvm = {
               hypervisor = "qemu";
@@ -208,6 +240,10 @@
                 libxext libxfixes libxrandr libxcb libxshmfence
                 gtk3 gdk-pixbuf libxt libxcursor libxi libxrender
                 freetype fontconfig pciutils ffmpeg
+              ] ++ lib.optionals (hasProfile "godot") [
+                libx11 libxcursor libxext libxi libxinerama libxrandr libxrender libxkbcommon
+                libGL vulkan-loader wayland libdecor
+                alsa-lib libpulseaudio dbus fontconfig udev
               ];
             };
 
@@ -234,6 +270,8 @@
             ]
             ++ lib.optionals (hasProfile "android") [ androidSdk jdk21 ]
             ++ lib.optionals (hasProfile "flatpak") [ flatpak-builder ]
+            # vulkaninfo/eglinfo, um zu sehen, womit Godot gerade rendert.
+            ++ lib.optionals (hasProfile "godot") [ godotBin vulkan-tools mesa-demos ]
             # Gebaut wird in der Build-Engine (sb2, mb2); hier nur, was der Editor und die
             # Skripte drumherum brauchen. Kein Qt aus Nix zum Bauen: das wäre 5.15, das
             # Target hat 5.6 -- IntelliSense nimmt die Header aus dem SDK-Sysroot.
@@ -389,6 +427,17 @@
                   chown 1000:1000 ${workspacePath}/target
                 ''}
 
+                ${lib.optionalString (hasProfile "godot") ''
+                  # Der Import-Cache ist viele kleine Dateien, über 9p quälend langsam;
+                  # außerdem gehört er zur Godot-Version der VM, nicht zu der des Hosts.
+                  mkdir -p /persist/godot-cache ${workspacePath}/.godot
+                  chown 1000:1000 /persist/godot-cache
+                  if ! mountpoint -q ${workspacePath}/.godot; then
+                    mount --bind /persist/godot-cache ${workspacePath}/.godot
+                  fi
+                  chown 1000:1000 ${workspacePath}/.godot
+                ''}
+
                 ${lib.optionalString (hasProfile "sailfish") ''
                   # Über 9p behält der Schlüssel Eigentümer und Rechte des Hosts.
                   install -m 600 -o 1000 -g 1000 ${sailfishSdkMount}/vmshare/ssh/private_keys/sdk \
@@ -423,4 +472,5 @@
       '';
   };
 }
+
 
