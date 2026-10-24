@@ -1,5 +1,5 @@
 {
-  description = "Zentrale MicroVM Sandbox für SolidJS, Rust/Tauri, Android, SailfishOS & Godot";
+  description = "Central MicroVM sandbox for SolidJS, Rust/Tauri, Android, SailfishOS & Godot";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -13,10 +13,7 @@
     lib.mkDevSandbox = {
       name,
       hostname ? "dev-vm",
-      # Adresse, an die alle weitergeleiteten Ports auf dem Host gebunden werden.
-      # Jede VM bekommt ihre eigene aus 127.0.0.0/8 (z.B. 127.0.10.1, 127.0.10.2, …):
-      # dann kollidieren weder SSH noch App-Ports zwischen parallel laufenden VMs,
-      # und nichts davon ist im LAN erreichbar. Leer ("") bindet an alle Interfaces.
+      # Host IP for forwarded ports. Unique 127.0.0.0/8 IPs prevent collisions across VMs. "" binds to all interfaces.
       hostAddress ? "127.0.0.1",
       sshPort ? 2222,
       ports ? [],
@@ -26,11 +23,9 @@
       profiles ? [ "solid" ],
       extraPackages ? (pkgs: []),
       extraEnv ? {},
-      # Nur für das Profil "android": überschreibt einzelne Felder von androidDefaults.
+      # Overrides for profile defaults
       android ? {},
-      # Nur für das Profil "sailfish": überschreibt einzelne Felder von sailfishDefaults.
       sailfish ? {},
-      # Nur für das Profil "godot": überschreibt einzelne Felder von godotDefaults.
       godot ? {}
     }:
     let
@@ -40,35 +35,28 @@
       hasProfile = p: builtins.elem p profiles;
       needsNode = (hasProfile "solid") || (hasProfile "tauri");
 
-      # Profile:
+      # Profiles:
       #   solid       Node, pnpm
-      #   playwright  Chromium/Firefox aus Nix plus ihre Bibliotheken
-      #   pocketbase  PocketBase, backend/pb_data auf /persist
-      #   tauri       Rust-Toolchain, WebKitGTK & Co., Tauri-CLI
-      #   rustup      mit tauri: rustup statt der Rust-Toolchain aus Nix (für Cross-Targets wie Android)
-      #   desktop     virtueller Bildschirm :99, D-Bus-Session-Werkzeuge, gnome-keyring/libsecret
-      #   android     Android-SDK/NDK/Emulator aus Nix, JDK 21, KVM für den Emulator
-      #   flatpak     flatpak + flatpak-builder (Flatpak-Dienst und Portal im Gast)
-      #   sailfish    Anbindung an das Sailfish SDK auf dem Host: Build-Engine und Emulator
-      #               per SSH über 10.0.2.2, das SDK-Verzeichnis read-only unter
-      #               /opt/sailfish-sdk; dazu qmllint, Python, RPM-Werkzeuge
-      #   godot       das offizielle Godot-Binary in genau der Version aus godotDefaults
-      #               (als `godot`, über nix-ld), Mesa in Software (llvmpipe/lavapipe),
-      #               dieselben Bibliotheken für exportierte Builds; .godot/ auf /persist.
-      #               Für ein Fenster zusammen mit "desktop" (Xvfb :99 bzw. ssh -X)
+      #   playwright  Nix browsers + runtime libs
+      #   pocketbase  PocketBase, backend/pb_data on /persist
+      #   tauri       Rust toolchain, WebKitGTK, Tauri CLI
+      #   rustup      Use rustup instead of Nix Rust (for cross-targets like Android)
+      #   desktop     Xvfb :99, D-Bus, gnome-keyring/libsecret
+      #   android     Android SDK/NDK/Emulator, JDK 21, nested KVM
+      #   flatpak     flatpak + flatpak-builder + XDG portal
+      #   sailfish    Connects to host Sailfish SDK via SLiRP (10.0.2.2) & read-only /opt/sailfish-sdk mount
+      #   godot       Official Godot binary (via nix-ld), Mesa software rendering, .godot/ on /persist
       androidDefaults = {
         platformVersions = [ "35" "36" ];
         buildToolsVersion = "36.0.0";
         ndkVersion = "27.2.12479018";
-        # Das Emulator-Image; seine Plattform muss in platformVersions stehen.
-        systemImagePlatform = "35";
+        systemImagePlatform = "35"; # Must be included in platformVersions
         systemImageType = "google_apis";
         abi = "x86_64";
       };
       androidConfig = androidDefaults // android;
 
-      # Das SDK selbst (Docker-Build-Engine, VirtualBox-Emulator) bleibt auf dem Host;
-      # der Gast erreicht dessen 127.0.0.1 über SLiRP als 10.0.2.2.
+      # SDK runs on the host; guest reaches host 127.0.0.1 via SLiRP at 10.0.2.2
       sailfishDefaults = {
         engineSshPort = 2222;
         emulatorSshPort = 2223;
@@ -76,9 +64,7 @@
       sailfishConfig = sailfishDefaults // sailfish;
       sailfishSdkMount = "/opt/sailfish-sdk";
 
-      # Das offizielle Release statt Godot aus nixpkgs: Projekte legen sich in
-      # project.godot auf eine Version fest, und die Export-Templates von GitHub
-      # müssen exakt dazu passen. Neue Version: version und hash zusammen ändern.
+      # Use official release binary to exactly match GitHub export templates
       godotDefaults = {
         version = "4.7.2";
         hash = "sha256-yt0yBOcoo10/E623/Q15AmNrefa5XEDCZetztsNTKeQ=";
@@ -103,8 +89,7 @@
             }).androidsdk;
             androidHome = "${androidSdk}/libexec/android-sdk";
 
-            # Godot linkt nur gegen die libc und lädt X11, Wayland, GL, Vulkan und
-            # Audio per dlopen; die Bibliotheken dafür kommen über nix-ld (unten).
+            # Godot dlopens X11/Wayland/GL/Vulkan/audio libs provided via nix-ld
             godotBin = pkgs.runCommand "godot-${godotConfig.version}" {
               nativeBuildInputs = [ pkgs.unzip ];
               src = pkgs.fetchurl {
@@ -119,27 +104,23 @@
             networking.hostName = hostname;
             system.stateVersion = "24.11";
 
-            # Erlaubt dem Agenten bei Bedarf auch `nix shell nixpkgs#foo` in der VM
             nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
             assertions = [{
               assertion = !(hasProfile "sailfish")
                 || !(builtins.elem sshPort [ sailfishConfig.engineSshPort sailfishConfig.emulatorSshPort ]);
-              message = "sshPort ${toString sshPort} gehört auf dem Host schon der Sailfish-Build-Engine bzw. dem Emulator; einen anderen wählen.";
+              message = "sshPort ${toString sshPort} conflicts with Sailfish build engine or emulator on host.";
             }];
 
-            # Das Android-SDK steht unter Googles Lizenz und ist unfrei.
             nixpkgs.config = lib.mkIf (hasProfile "android") {
               allowUnfree = true;
               android_sdk.accept_license = true;
             };
 
-            # Der Emulator braucht /dev/kvm im Gast: verschachtelte Virtualisierung,
-            # auf dem Host einmal `kvm_intel nested=1` bzw. `kvm_amd nested=1`.
+            # Requires nested virtualization enabled on the host
             boot.kernelModules = lib.optionals (hasProfile "android") [ "kvm-intel" "kvm-amd" ];
 
-            # Keine GPU in der VM: Mesa rendert in Software, GL über llvmpipe,
-            # Vulkan über lavapipe -- beides unter /run/opengl-driver.
+            # Mesa software rendering (llvmpipe/lavapipe)
             hardware.graphics.enable = hasProfile "godot";
 
             microvm = {
@@ -162,8 +143,7 @@
                   securityModel = "none";
                 }
               ] ++ lib.optional (hasProfile "sailfish") {
-                # Ein Symlink, den run-microvm auf das SDK des Hosts setzt: dessen Pfad
-                # steht erst zur Laufzeit fest ($SAILFISH_SDK_PATH bzw. .env).
+                # Symlink created at runtime by run-microvm
                 proto = "9p";
                 tag = "sailfish-sdk";
                 source = ".microvm-state/sailfish-sdk";
@@ -204,7 +184,6 @@
             };
             security.sudo.wheelNeedsPassword = false;
 
-            # GUI-Programme ohne Bildschirm: ein virtueller auf :99 (DISPLAY steht unten).
             systemd.tmpfiles.rules = lib.optionals (hasProfile "desktop") [ "d /tmp/.X11-unix 1777 root root -" ];
             systemd.services.xvfb = lib.mkIf (hasProfile "desktop") {
               description = "Virtual X display :99";
@@ -237,7 +216,7 @@
               enable = true;
               libraries = with pkgs; [
                 stdenv.cc.cc zlib openssl icu libatomic_ops
-                # Häufige C-Libs für Python-Wheels (numpy, pillow etc.) & Node:
+                # Common C libs for Python wheels & Node native addons
                 glib libxml2 libxslt sqlite libffi xz bzip2 zstd
               ] ++ lib.optionals (hasProfile "playwright") [
                 nss nspr cairo pango atk at-spi2-atk cups dbus libdrm mesa
@@ -259,11 +238,10 @@
             ]);
 
             environment.systemPackages = with pkgs; [
-              python3 uv nodejs pnpm 
+              python3 uv nodejs pnpm
               bash-completion
-              # generall usefull utilities
-              curl diffutils file gcc git git-lfs gnumake fd fzf gnupg jq less patch pkg-config procps ripgrep sqlite tree unzip wget  which xz zip
-              just mise 
+              curl diffutils file gcc git git-lfs gnumake fd fzf gnupg jq less patch pkg-config procps ripgrep sqlite tree unzip wget which xz zip
+              just mise
             ]
             ++ lib.optionals needsNode [ nodejs pnpm ]
             ++ lib.optionals (hasProfile "pocketbase") [ pocketbase ]
@@ -278,14 +256,11 @@
             ]
             ++ lib.optionals (hasProfile "android") [ androidSdk jdk21 ]
             ++ lib.optionals (hasProfile "flatpak") [ flatpak-builder ]
-            # vulkaninfo/eglinfo, um zu sehen, womit Godot gerade rendert.
             ++ lib.optionals (hasProfile "godot") [ godotBin vulkan-tools mesa-demos ]
-            # Gebaut wird in der Build-Engine (sb2, mb2); hier nur, was der Editor und die
-            # Skripte drumherum brauchen. Kein Qt aus Nix zum Bauen: das wäre 5.15, das
-            # Target hat 5.6 -- IntelliSense nimmt die Header aus dem SDK-Sysroot.
+            # Builds happen in the SDK build engine; headers come from SDK sysroot
             ++ lib.optionals (hasProfile "sailfish") [
               openssh rsync python3 gcc gdb rpm file
-              qt5.qtdeclarative  # qmllint
+              qt5.qtdeclarative # qmllint
             ]
             ++ (extraPackages pkgs);
 
@@ -320,11 +295,11 @@
                 pkgs.dbus
                 pkgs.zlib
               ] ++ (extraPackages pkgs))) + ":${pkgs.zlib.dev}/share/pkgconfig";
-              # Ohne glib-networking kann WebKitGTK kein TLS.
+              # Required for WebKitGTK TLS support
               GIO_EXTRA_MODULES = "${pkgs.glib-networking}/lib/gio/modules";
             }
             // lib.optionalAttrs (hasProfile "desktop") {
-              # Kein Accessibility-Bus in der VM: sagen statt GTK in den Timeout laufen lassen.
+              # Prevent GTK timeouts waiting for non-existent accessibility bus
               NO_AT_BRIDGE = "1";
             }
             // lib.optionalAttrs (hasProfile "android") {
@@ -333,15 +308,13 @@
               NDK_HOME = "${androidHome}/ndk/${androidConfig.ndkVersion}";
               ANDROID_NDK_ROOT = "${androidHome}/ndk/${androidConfig.ndkVersion}";
               JAVA_HOME = "${pkgs.jdk21.home}";
-              # aapt2 aus Maven ist ein fremdes Binary; das aus dem SDK läuft hier.
+              # Force Gradle to use Nix SDK's patched aapt2 instead of Maven binary
               GRADLE_OPTS = "-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidHome}/build-tools/${androidConfig.buildToolsVersion}/aapt2";
-              # Welches Image ein AVD braucht, für `avdmanager create avd -k "$ANDROID_SYSTEM_IMAGE"`.
               ANDROID_SYSTEM_IMAGE = "system-images;android-${androidConfig.systemImagePlatform};${androidConfig.systemImageType};${androidConfig.abi}";
             }
             // lib.optionalAttrs (hasProfile "sailfish") {
               IN_SAILFISH_SANDBOX = "true";
               SAILFISH_SDK_PATH = sailfishSdkMount;
-              # Kopie des SDK-Schlüssels mit Rechten, die ssh akzeptiert (sandbox-setup).
               SAILFISH_SDK_SSH_KEY = "/home/dev/.ssh/sailfish-sdk";
               SAILFISH_ENGINE_HOST = "10.0.2.2";
               SAILFISH_ENGINE_PORT = toString sailfishConfig.engineSshPort;
@@ -353,7 +326,7 @@
             environment.interactiveShellInit = ''
               export PATH="${workspacePath}/node_modules/.bin:/home/dev/.local/bin:${lib.optionalString (hasProfile "rustup") "/home/dev/.cargo/bin:"}$PATH"
               ${lib.optionalString (hasProfile "desktop") ''
-                # SSH X11-Forwarding erhält Vorrang vor dem internen Xvfb :99
+                # Prefer SSH X11 forwarding over internal Xvfb :99
                 export DISPLAY="''${DISPLAY:-:99}"
               ''}
               alias jump="just"
@@ -436,8 +409,7 @@
                 ''}
 
                 ${lib.optionalString (hasProfile "godot") ''
-                  # Der Import-Cache ist viele kleine Dateien, über 9p quälend langsam;
-                  # außerdem gehört er zur Godot-Version der VM, nicht zu der des Hosts.
+                  # Keep import cache off 9p for performance and version isolation
                   mkdir -p /persist/godot-cache ${workspacePath}/.godot
                   chown 1000:1000 /persist/godot-cache
                   if ! mountpoint -q ${workspacePath}/.godot; then
@@ -447,10 +419,10 @@
                 ''}
 
                 ${lib.optionalString (hasProfile "sailfish") ''
-                  # Über 9p behält der Schlüssel Eigentümer und Rechte des Hosts.
+                  # Copy SDK key from 9p share to enforce strict SSH permissions
                   install -m 600 -o 1000 -g 1000 ${sailfishSdkMount}/vmshare/ssh/private_keys/sdk \
                     /persist/home-dev/.ssh/sailfish-sdk \
-                    || echo "sandbox-setup: kein SDK-Schlüssel unter ${sailfishSdkMount}/vmshare/ssh/private_keys" >&2
+                    || echo "sandbox-setup: missing SDK key in ${sailfishSdkMount}/vmshare/ssh/private_keys" >&2
                 ''}
               '';
             };
@@ -461,7 +433,7 @@
     in
       pkgs.writeShellScriptBin "run-microvm" ''
         mkdir -p .microvm-state
-        # Wo das Projekt auf dem Host liegt; der Gast sieht es nur unter ${workspacePath}.
+        # Record host project path (guest only sees ${workspacePath})
         pwd -P > .microvm-state/host-workspace
         ${nixpkgs.lib.optionalString (hasProfile "sailfish") ''
           sdk="''${SAILFISH_SDK_PATH:-}"
@@ -471,7 +443,7 @@
           sdk="''${sdk:-$HOME/SailfishOS}"
           sdk="''${sdk//\$HOME/$HOME}"
           if [ ! -d "$sdk/vmshare" ]; then
-            echo "run-microvm: kein Sailfish SDK unter $sdk -- SAILFISH_SDK_PATH setzen" >&2
+            echo "run-microvm: Sailfish SDK not found at $sdk -- set SAILFISH_SDK_PATH" >&2
             exit 1
           fi
           ln -sfn "$(realpath "$sdk")" .microvm-state/sailfish-sdk
@@ -480,5 +452,3 @@
       '';
   };
 }
-
-
