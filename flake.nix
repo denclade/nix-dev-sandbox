@@ -274,7 +274,7 @@
               libappindicator librsvg openssl dbus zlib harfbuzz
             ] ++ (if hasProfile "rustup" then [ rustup ] else [ rustc cargo rustfmt clippy rust-analyzer ]))
             ++ lib.optionals (hasProfile "desktop") [
-              xvfb dbus gnome-keyring libsecret desktop-file-utils xdg-utils xorg.xauth
+              xvfb dbus gnome-keyring libsecret desktop-file-utils xdg-utils xauth
             ]
             ++ lib.optionals (hasProfile "android") [ androidSdk jdk21 ]
             ++ lib.optionals (hasProfile "flatpak") [ flatpak-builder ]
