@@ -119,6 +119,9 @@
             networking.hostName = hostname;
             system.stateVersion = "24.11";
 
+            # Erlaubt dem Agenten bei Bedarf auch `nix shell nixpkgs#foo` in der VM
+            nix.settings.experimental-features = [ "nix-command" "flakes" ];
+
             assertions = [{
               assertion = !(hasProfile "sailfish")
                 || !(builtins.elem sshPort [ sailfishConfig.engineSshPort sailfishConfig.emulatorSshPort ]);
@@ -234,6 +237,8 @@
               enable = true;
               libraries = with pkgs; [
                 stdenv.cc.cc zlib openssl icu libatomic_ops
+                # Häufige C-Libs für Python-Wheels (numpy, pillow etc.) & Node:
+                glib libxml2 libxslt sqlite libffi xz bzip2 zstd
               ] ++ lib.optionals (hasProfile "playwright") [
                 nss nspr cairo pango atk at-spi2-atk cups dbus libdrm mesa
                 libxkbcommon alsa-lib glib expat libx11 libxcomposite libxdamage
@@ -254,8 +259,11 @@
             ]);
 
             environment.systemPackages = with pkgs; [
-              git git-lfs curl gnupg less procps unzip zip xz bash-completion
-              just
+              python3 uv nodejs pnpm 
+              bash-completion
+              # generall usefull utilities
+              curl diffutils file gcc git git-lfs gnumake fd fzf gnupg jq less patch pkg-config procps ripgrep sqlite tree unzip wget  which xz zip
+              just mise 
             ]
             ++ lib.optionals needsNode [ nodejs pnpm ]
             ++ lib.optionals (hasProfile "pocketbase") [ pocketbase ]
