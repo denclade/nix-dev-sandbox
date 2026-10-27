@@ -1,5 +1,5 @@
 {
-  description = "Central MicroVM sandbox for SolidJS, Rust/Tauri, Android, SailfishOS & Godot";
+  description = "Central MicroVM sandbox for SolidJS, Rust/Tauri, Android, SailfishOS, Godot & Python/ML";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -23,10 +23,19 @@
       profiles ? [ "solid" ],
       extraPackages ? (pkgs: []),
       extraEnv ? {},
+      # Additional NixOS modules, merged into the guest config (e.g. extra nix-ld libraries)
+      extraModules ? [],
+      # Workspace-relative dirs kept on /persist instead of 9p (like node_modules), e.g. [ ".venv" ]
+      persistDirs ? [],
+      # Host dirs outside the project, e.g. datasets. Host path from $envVar, then .env, then default.
+      #   [{ tag; envVar; mountPoint; default ? ""; readOnly ? true; required ? false; }]
+      # Missing optional dirs are mounted as empty dir so the VM still boots.
+      hostShares ? [],
       # Overrides for profile defaults
       android ? {},
       sailfish ? {},
-      godot ? {}
+      godot ? {},
+      nvidia ? {}
     }:
     let
       system = "x86_64-linux";
@@ -46,6 +55,7 @@
       #   flatpak     flatpak + flatpak-builder + XDG portal
       #   sailfish    Connects to host Sailfish SDK via SLiRP (10.0.2.2) & read-only /opt/sailfish-sdk mount
       #   godot       Official Godot binary (via nix-ld), Mesa software rendering, .godot/ on /persist
+      #   nvidia      VFIO passthrough of a host NVIDIA GPU (exclusive while the VM runs), driver + libcuda via nix-ld
       androidDefaults = {
         platformVersions = [ "35" "36" ];
         buildToolsVersion = "36.0.0";
@@ -71,10 +81,25 @@
       };
       godotConfig = godotDefaults // godot;
 
+      # Host PCI addresses of all functions in the GPU's IOMMU group (GPU + HDMI audio), e.g. "0000:01:00.0".
+      # Find them with: lspci -D -nn | grep -i nvidia
+      nvidiaDefaults = {
+        pciDevices = [];
+        # Open kernel modules, required for Blackwell (RTX 50xx) and recommended since Turing
+        open = true;
+        # Attribute of boot.kernelPackages.nvidiaPackages
+        driver = "stable";
+      };
+      nvidiaConfig = nvidiaDefaults // nvidia;
+
+      hostShareDefaults = { default = ""; readOnly = true; required = false; };
+      hostShareList = map (s: hostShareDefaults // s) hostShares;
+
       vmSystem = nixpkgs.lib.nixosSystem {
         inherit system;
         modules = [
           microvm.nixosModules.microvm
+        ] ++ extraModules ++ [
           ({ config, lib, pkgs, ... }:
           let
             androidSdk = (pkgs.androidenv.composeAndroidPackages {
@@ -110,22 +135,42 @@
               assertion = !(hasProfile "sailfish")
                 || !(builtins.elem sshPort [ sailfishConfig.engineSshPort sailfishConfig.emulatorSshPort ]);
               message = "sshPort ${toString sshPort} conflicts with Sailfish build engine or emulator on host.";
+            } {
+              assertion = !(hasProfile "nvidia") || nvidiaConfig.pciDevices != [];
+              message = "Profile nvidia needs nvidia.pciDevices (host PCI addresses of the GPU's IOMMU group).";
             }];
 
-            nixpkgs.config = lib.mkIf (hasProfile "android") {
-              allowUnfree = true;
-              android_sdk.accept_license = true;
-            };
+            nixpkgs.config = lib.mkMerge [
+              (lib.mkIf (hasProfile "android") {
+                allowUnfree = true;
+                android_sdk.accept_license = true;
+              })
+              (lib.mkIf (hasProfile "nvidia") { allowUnfree = true; })
+            ];
 
             # Requires nested virtualization enabled on the host
             boot.kernelModules = lib.optionals (hasProfile "android") [ "kvm-intel" "kvm-amd" ];
 
-            # Mesa software rendering (llvmpipe/lavapipe)
-            hardware.graphics.enable = hasProfile "godot";
+            # Mesa software rendering (llvmpipe/lavapipe), also for GL apps on Xvfb / ssh -X
+            hardware.graphics.enable = lib.mkDefault (hasProfile "godot" || hasProfile "desktop" || hasProfile "nvidia");
+
+            # Only the kernel module and userspace libs; no X server is started
+            services.xserver.videoDrivers = lib.mkIf (hasProfile "nvidia") [ "nvidia" ];
+            hardware.nvidia = lib.mkIf (hasProfile "nvidia") {
+              inherit (nvidiaConfig) open;
+              package = config.boot.kernelPackages.nvidiaPackages.${nvidiaConfig.driver};
+              nvidiaSettings = false;
+              # Keeps the GPU initialized between CUDA processes in the headless guest
+              nvidiaPersistenced = true;
+            };
 
             microvm = {
               hypervisor = "qemu";
               inherit vcpu mem;
+
+              # q35 instead of the microvm machine: PCIe root complex with room for large GPU BARs
+              qemu.machine = lib.mkIf (hasProfile "nvidia") "q35";
+              devices = lib.optionals (hasProfile "nvidia") (map (path: { bus = "pci"; inherit path; }) nvidiaConfig.pciDevices);
 
               shares = [
                 {
@@ -150,7 +195,13 @@
                 mountPoint = sailfishSdkMount;
                 securityModel = "none";
                 readOnly = true;
-              };
+              } ++ map (s: {
+                # Symlink created at runtime by run-microvm
+                proto = "9p";
+                inherit (s) tag mountPoint readOnly;
+                source = ".microvm-state/shares/${s.tag}";
+                securityModel = "none";
+              }) hostShareList;
 
               volumes = [{
                 image = ".microvm-state/persistent.img";
@@ -228,6 +279,9 @@
                 libx11 libxcursor libxext libxi libxinerama libxrandr libxrender libxkbcommon
                 libGL vulkan-loader wayland libdecor
                 alsa-lib libpulseaudio dbus fontconfig udev
+              ] ++ lib.optionals (hasProfile "nvidia") [
+                # libcuda.so.1 / libnvidia-ml.so.1 for pip wheels (PyTorch ships its own CUDA runtime)
+                config.hardware.nvidia.package
               ];
             };
 
@@ -418,6 +472,15 @@
                   chown 1000:1000 ${workspacePath}/.godot
                 ''}
 
+                ${lib.concatMapStrings (d: ''
+                  mkdir -p "/persist/dirs/${d}" "${workspacePath}/${d}"
+                  chown 1000:1000 "/persist/dirs/${d}"
+                  if ! mountpoint -q "${workspacePath}/${d}"; then
+                    mount --bind "/persist/dirs/${d}" "${workspacePath}/${d}"
+                  fi
+                  chown 1000:1000 "${workspacePath}/${d}"
+                '') persistDirs}
+
                 ${lib.optionalString (hasProfile "sailfish") ''
                   # Copy SDK key from 9p share to enforce strict SSH permissions
                   install -m 600 -o 1000 -g 1000 ${sailfishSdkMount}/vmshare/ssh/private_keys/sdk \
@@ -430,12 +493,90 @@
         ];
       };
       runner = vmSystem.config.microvm.declaredRunner;
-    in
-      pkgs.writeShellScriptBin "run-microvm" ''
+      lib = nixpkgs.lib;
+
+      # Host side, run as root: hands the GPU to vfio-pci and back. Not needed for non-GPU profiles.
+      gpuScript = pkgs.writeShellScriptBin "microvm-gpu" ''
+        set -euo pipefail
+        user="''${SUDO_USER:-$(id -un)}"
+        case "''${1:-}" in
+          bind)
+            ${pkgs.kmod}/bin/modprobe vfio-pci
+            ${lib.concatMapStrings (dev: ''
+              cd /sys/bus/pci/devices/${dev}
+              if [ "$(basename "$(readlink -f driver 2>/dev/null)")" != vfio-pci ]; then
+                [ -e driver ] && echo ${dev} > driver/unbind
+                echo vfio-pci > driver_override
+                echo ${dev} > /sys/bus/pci/drivers_probe
+              fi
+              group=$(basename "$(readlink iommu_group)")
+              for member in iommu_group/devices/*; do
+                case " ${toString nvidiaConfig.pciDevices} " in
+                  *" $(basename "$member") "*) ;;
+                  *) echo "microvm-gpu: $(basename "$member") shares IOMMU group $group, add it to nvidia.pciDevices" >&2 ;;
+                esac
+              done
+              chown "$user" /dev/vfio/"$group"
+              echo "${dev} -> vfio-pci (/dev/vfio/$group for $user)"
+            '') nvidiaConfig.pciDevices}
+            ;;
+          release)
+            ${lib.concatMapStrings (dev: ''
+              cd /sys/bus/pci/devices/${dev}
+              [ -e driver ] && echo ${dev} > driver/unbind
+              echo > driver_override
+              echo ${dev} > /sys/bus/pci/drivers_probe
+              if [ -e driver ]; then echo "${dev} -> $(basename "$(readlink -f driver)")"; else echo "${dev} -> no driver"; fi
+            '') nvidiaConfig.pciDevices}
+            ;;
+          *)
+            echo "usage: sudo microvm-gpu bind|release   (stop all host GPU users before bind, e.g. nvidia-persistenced)" >&2
+            exit 1
+            ;;
+        esac
+      '';
+
+      runScript = pkgs.writeShellScriptBin "run-microvm" ''
         mkdir -p .microvm-state
         # Record host project path (guest only sees ${workspacePath})
         pwd -P > .microvm-state/host-workspace
-        ${nixpkgs.lib.optionalString (hasProfile "sailfish") ''
+        ${lib.concatMapStrings (s: ''
+          src="''${${s.envVar}:-}"
+          if [ -z "$src" ] && [ -f .env ]; then
+            src=$(grep -E "^[[:space:]]*${s.envVar}=" .env | tail -n 1 | cut -d= -f2- | tr -d "\r\"'")
+          fi
+          src="''${src:-${s.default}}"
+          src="''${src//\$HOME/$HOME}"
+          link=.microvm-state/shares/${s.tag}
+          mkdir -p .microvm-state/shares
+          if [ -L "$link" ]; then rm "$link"; elif [ -d "$link" ]; then rmdir "$link"; fi
+          if [ -n "$src" ] && [ -d "$src" ]; then
+            ln -s "$(realpath "$src")" "$link"
+          ${if s.required then ''
+          else
+            echo "run-microvm: ${s.tag} not found at '$src' -- set ${s.envVar}" >&2
+            exit 1
+          '' else ''
+          else
+            echo "run-microvm: ${s.tag} not found at '$src' (${s.envVar}), mounting an empty dir" >&2
+            mkdir "$link"
+          ''}
+          fi
+        '') hostShareList}
+        ${lib.optionalString (hasProfile "nvidia") ''
+          for dev in ${toString nvidiaConfig.pciDevices}; do
+            if [ "$(basename "$(readlink -f /sys/bus/pci/devices/$dev/driver 2>/dev/null)")" != vfio-pci ]; then
+              echo "run-microvm: $dev is not bound to vfio-pci -- run: sudo ${gpuScript}/bin/microvm-gpu bind" >&2
+              exit 1
+            fi
+          done
+          # VFIO pins all guest RAM
+          if [ "$(ulimit -l)" != unlimited ] && [ "$(ulimit -l)" -lt $((${toString mem} * 1024)) ]; then
+            echo "run-microvm: memlock limit $(ulimit -l) KiB < ${toString mem} MiB guest RAM -- raise it (limits.conf / ulimit -l)" >&2
+            exit 1
+          fi
+        ''}
+        ${lib.optionalString (hasProfile "sailfish") ''
           sdk="''${SAILFISH_SDK_PATH:-}"
           if [ -z "$sdk" ] && [ -f .env ]; then
             sdk=$(grep -E "^[[:space:]]*SAILFISH_SDK_PATH=" .env | tail -n 1 | cut -d= -f2- | tr -d "\r\"'")
@@ -450,5 +591,13 @@
         ''}
         exec ${runner}/bin/microvm-run "$@"
       '';
+    in
+      if hasProfile "nvidia" then
+        pkgs.symlinkJoin {
+          name = "run-microvm";
+          paths = [ runScript gpuScript ];
+          meta.mainProgram = "run-microvm";
+        }
+      else runScript;
   };
 }
