@@ -127,6 +127,8 @@
             '';
           in {
             networking.hostName = hostname;
+            # Allow host to access the given ports
+            networking.firewall.allowedTCPPorts = ports;
             system.stateVersion = "24.11";
 
             nix.settings.experimental-features = [ "nix-command" "flakes" ];
