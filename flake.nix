@@ -302,8 +302,7 @@
               bash-completion
               curl diffutils file gcc git git-lfs gnumake fd fzf gnupg jq less patch pkg-config procps ripgrep sqlite tree unzip wget which xz zip
               just mise
-              # Zed runs on the host; its remote language servers run in the guest.
-              nixd
+              nixd bubblewrap
             ]
             ++ lib.optionals needsNode [ nodejs pnpm ]
             ++ lib.optionals (hasProfile "pocketbase") [ pocketbase ]
