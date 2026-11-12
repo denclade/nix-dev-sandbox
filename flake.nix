@@ -25,7 +25,9 @@
       extraEnv ? {},
       # Additional NixOS modules, merged into the guest config (e.g. extra nix-ld libraries)
       extraModules ? [],
-      # Workspace-relative dirs kept on /persist instead of 9p (like node_modules), e.g. [ ".venv" ]
+      # Workspace transport; keep 9p available for hosts without unprivileged user namespaces.
+      workspaceProtocol ? "virtiofs",
+      # Workspace-relative dirs kept on /persist instead of the host share, e.g. [ ".venv" ]
       persistDirs ? [],
       # Host dirs outside the project, e.g. datasets. Host path from $envVar, then .env, then default.
       #   [{ tag; envVar; mountPoint; default ? ""; readOnly ? true; required ? false; }]
@@ -37,6 +39,7 @@
       godot ? {},
       nvidia ? {}
     }:
+    assert builtins.elem workspaceProtocol [ "virtiofs" "9p" ];
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
@@ -176,7 +179,8 @@
 
               shares = [
                 {
-                  proto = "9p";
+                  proto = workspaceProtocol;
+                  socket = if workspaceProtocol == "virtiofs" then ".microvm-state/workspace.sock" else null;
                   tag = "workspace";
                   source = "./.";
                   mountPoint = workspacePath;
@@ -298,6 +302,8 @@
               bash-completion
               curl diffutils file gcc git git-lfs gnumake fd fzf gnupg jq less patch pkg-config procps ripgrep sqlite tree unzip wget which xz zip
               just mise
+              # Zed runs on the host; its remote language servers run in the guest.
+              nixd
             ]
             ++ lib.optionals needsNode [ nodejs pnpm ]
             ++ lib.optionals (hasProfile "pocketbase") [ pocketbase ]
@@ -465,7 +471,7 @@
                 ''}
 
                 ${lib.optionalString (hasProfile "godot") ''
-                  # Keep import cache off 9p for performance and version isolation
+                  # Keep import cache off the host share for performance and version isolation
                   mkdir -p /persist/godot-cache ${workspacePath}/.godot
                   chown 1000:1000 /persist/godot-cache
                   if ! mountpoint -q ${workspacePath}/.godot; then
@@ -484,7 +490,7 @@
                 '') persistDirs}
 
                 ${lib.optionalString (hasProfile "sailfish") ''
-                  # Copy SDK key from 9p share to enforce strict SSH permissions
+                  # Copy SDK key from the host share to enforce strict SSH permissions
                   install -m 600 -o 1000 -g 1000 ${sailfishSdkMount}/vmshare/ssh/private_keys/sdk \
                     /persist/home-dev/.ssh/sailfish-sdk \
                     || echo "sandbox-setup: missing SDK key in ${sailfishSdkMount}/vmshare/ssh/private_keys" >&2
@@ -538,8 +544,114 @@
         esac
       '';
 
+      # The upstream virtiofsd-run uses a root supervisord. This launcher runs
+      # the workspace daemon as the invoking user and supervises both processes.
+      supervisorScript = pkgs.writeText "sandbox-supervisor.py" ''
+        import os
+        from pathlib import Path
+        import signal
+        import subprocess
+        import sys
+        import time
+
+        processes = []
+        workspace_socket = Path(".microvm-state/workspace.sock")
+
+        class StopRequested(Exception):
+            def __init__(self, signum):
+                self.signum = signum
+
+        def request_stop(signum, _frame):
+            raise StopRequested(signum)
+
+        def stop_processes():
+            # Stop QEMU before its file server. Kill process groups as the daemon
+            # may fork to enter its sandbox; a PID alone would leave children.
+            for process in reversed(processes):
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+
+        def run():
+            daemon = None
+            if ${builtins.toJSON workspaceProtocol} == "virtiofs":
+                workspace_socket.unlink(missing_ok=True)
+                uid, gid = os.getuid(), os.getgid()
+                # Guest root performs bind-mount setup, dev (1000) edits files.
+                # Both operate with the host user's existing permissions. Never
+                # grant the daemon host root or disable its namespace sandbox.
+                daemon = subprocess.Popen([
+                    "${pkgs.virtiofsd}/bin/virtiofsd",
+                    "--shared-dir=" + os.getcwd(),
+                    "--socket-path=" + str(workspace_socket),
+                    "--sandbox=namespace",
+                    "--inode-file-handles=never",
+                    "--cache=auto",
+                    "--translate-uid=squash-guest:0:" + str(uid) + ":4294967295",
+                    "--translate-gid=squash-guest:0:" + str(gid) + ":4294967295",
+                    "--translate-uid=host:" + str(uid) + ":1000:1",
+                    "--translate-gid=host:" + str(gid) + ":1000:1",
+                ], stdin=subprocess.DEVNULL, start_new_session=True)
+                processes.append(daemon)
+                deadline = time.monotonic() + 15
+                while not workspace_socket.is_socket():
+                    if daemon.poll() is not None:
+                        raise RuntimeError("virtiofsd stopped before creating its socket")
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("virtiofsd did not become ready within 15 seconds")
+                    time.sleep(0.05)
+                if daemon.poll() is not None:
+                    raise RuntimeError("virtiofsd stopped during startup")
+
+            vm = subprocess.Popen(
+                ["${runner}/bin/microvm-run", *sys.argv[1:]],
+                start_new_session=True,
+            )
+            processes.append(vm)
+            while vm.poll() is None:
+                if daemon is not None and daemon.poll() is not None:
+                    raise RuntimeError("virtiofsd stopped while the VM was running")
+                time.sleep(0.1)
+            return vm.returncode if vm.returncode >= 0 else 128 - vm.returncode
+
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, request_stop)
+        status = 1
+        try:
+            status = run()
+        except StopRequested as error:
+            status = 128 + error.signum
+        except (OSError, RuntimeError) as error:
+            print("run-microvm: " + str(error), file=sys.stderr)
+        finally:
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                signal.signal(sig, signal.SIG_IGN)
+            stop_processes()
+            if ${builtins.toJSON workspaceProtocol} == "virtiofs":
+                workspace_socket.unlink(missing_ok=True)
+        sys.exit(status)
+      '';
+
       runScript = pkgs.writeShellScriptBin "run-microvm" ''
+        set -eu
+        umask 077
         mkdir -p .microvm-state
+        # Protect the persistent image and socket from a second launcher.
+        exec 9>.microvm-state/run.lock
+        if ! ${pkgs.util-linux}/bin/flock -n 9; then
+          echo "run-microvm: this workspace already has a running VM" >&2
+          exit 1
+        fi
         # Record host project path (guest only sees ${workspacePath})
         pwd -P > .microvm-state/host-workspace
         ${lib.concatMapStrings (s: ''
@@ -591,7 +703,7 @@
           fi
           ln -sfn "$(realpath "$sdk")" .microvm-state/sailfish-sdk
         ''}
-        exec ${runner}/bin/microvm-run "$@"
+        exec ${pkgs.python3}/bin/python3 ${supervisorScript} "$@"
       '';
     in
       if hasProfile "nvidia" then
